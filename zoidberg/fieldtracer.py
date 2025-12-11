@@ -925,3 +925,190 @@ class EMC3FieldTracer(FieldTracer):
         mesh.phi = phi
         mesh.perBC = perBC
         return mesh
+
+###############################################################################
+# NEW: FieldTracerFrenet – field-line following in Frenet coordinates
+###############################################################################
+
+import numpy as _np
+from scipy.interpolate import CubicSpline as _CubicSpline
+from scipy.integrate import odeint as _odeint
+
+
+def _arc_length(points):
+    """Compute arc-length parameter s for centerline points."""
+    dif = _np.diff(points, axis=0)
+    ds = _np.linalg.norm(dif, axis=1)
+    return _np.concatenate(([0], _np.cumsum(ds)))
+
+
+def _build_splines(points):
+    """Return splines r(s) for centerline."""
+    s = _arc_length(points)
+    sx = _CubicSpline(s, points[:, 0], bc_type="periodic")
+    sy = _CubicSpline(s, points[:, 1], bc_type="periodic")
+    sz = _CubicSpline(s, points[:, 2], bc_type="periodic")
+    return s, (sx, sy, sz)
+
+
+def _frenet_frame(sval, splines):
+    """Return centerline position and Frenet-Serret frame at s."""
+    sx, sy, sz = splines
+    r  = _np.array([sx(sval), sy(sval), sz(sval)])
+    r1 = _np.array([sx(sval,1), sy(sval,1), sz(sval,1)])
+    r2 = _np.array([sx(sval,2), sy(sval,2), sz(sval,2)])
+
+    # Tangent
+    T = r1 / (_np.linalg.norm(r1) + 1e-16)
+
+    # Normal
+    r2_par = _np.dot(r2, T) * T
+    N_raw  = r2 - r2_par
+    nrm    = _np.linalg.norm(N_raw)
+
+    if nrm < 1e-12:
+        # fallback if curvature ~ 0
+        zaxis = _np.array([0, 0, 1.0])
+        N = _np.cross(T, _np.cross(zaxis, T))
+        N /= _np.linalg.norm(N)
+    else:
+        N = N_raw / nrm
+
+    # Binormal
+    Bf = _np.cross(T, N)
+
+    return r, T, N, Bf
+
+
+class FieldTracerFrenet(object):
+    """
+    Field-line tracing in the Frenet frame.
+    Integrates (s,u,v) instead of (R,Z) vs toroidal angle.
+
+    Parameters
+    ----------
+    field : MagneticField
+        Zoidberg MagneticField object.
+    centerline_points : array_like (N,3)
+        3-D curve defining centerline for Frenet frame.
+        Should lie on (or inside) the flux surface being traced.
+    """
+
+    def __init__(self, field, centerline_points):
+        self.field_direction = field.field_direction
+        self.s, self.splines = _build_splines(_np.asarray(centerline_points))
+
+    def _xyz_from_suv(self, s, u, v):
+        r, T, N, Bf = _frenet_frame(s, self.splines)
+        return r + u*N + v*Bf
+
+    def _project_to_centerline(self, x, z, y):
+        """
+        Convert starting (R=x,Z=z,phi=y) point into (s,u,v)
+        by minimizing distance to r(s).
+        """
+        # Convert back to Cartesian
+        X = x * _np.cos(y)
+        Y = x * _np.sin(y)
+        Z = z
+        p = _np.array([X, Y, Z])
+
+        # brute-force nearest point along centerline
+        svals = _np.linspace(self.s[0], self.s[-1], 200)
+        cl = _np.array([[
+            self.splines[0](sv),
+            self.splines[1](sv),
+            self.splines[2](sv)] for sv in svals])
+        d2 = _np.sum((cl - p)**2, axis=1)
+        idx = _np.argmin(d2)
+        s0 = svals[idx]
+
+        r, T, N, Bf = _frenet_frame(s0, self.splines)
+        uv = p - r
+        u0 = _np.dot(uv, N)
+        v0 = _np.dot(uv, Bf)
+        return s0, u0, v0
+
+    def follow_field_lines(self, x_values, z_values, y_values, rtol=None):
+        """
+        Same public interface as FieldTracer.follow_field_lines,
+        but integrates in Frenet coordinates (s,u,v).
+        """
+
+        x_values = _np.atleast_1d(x_values)
+        y_values = _np.atleast_1d(y_values)
+        z_values = _np.atleast_1d(z_values)
+
+        if x_values.shape != z_values.shape:
+            if x_values.size == 1:
+                x_values = _np.zeros(z_values.shape) + x_values
+            elif z_values.size == 1:
+                z_values = _np.zeros(x_values.shape) + z_values
+            else:
+                raise ValueError("Shape mismatch in x_values/z_values")
+
+        orig_shape = x_values.shape
+        flat = (x_values.ndim > 1)
+        if flat:
+            x_values = x_values.flatten()
+            z_values = z_values.flatten()
+
+        # Convert initial (x,z,y0) points to Frenet coordinates
+        s0 = _np.zeros_like(x_values)
+        u0 = _np.zeros_like(x_values)
+        v0 = _np.zeros_like(x_values)
+        y0 = y_values[0]
+
+        for i,(x,z) in enumerate(zip(x_values, z_values)):
+            ss,uu,vv = self._project_to_centerline(x, z, y0)
+            s0[i]=ss
+            u0[i]=uu
+            v0[i]=vv
+
+        # ODE in Frenet coordinates
+        def rhs(SUV, y):
+            s, u, v = SUV
+            # Evaluate magnetic field components in (x,z)
+            X,Y,Z = self._xyz_from_suv(s,u,v)
+            R = _np.sqrt(X*X + Y*Y)
+            phi = _np.arctan2(Y, X)
+            dxdy, dzdy = self.field_direction((R, Z), phi)
+
+            # reconstruct full B vector
+            # dR/dphi = dxdy  ,  dZ/dphi = dzdy
+            dX = dxdy*_np.cos(phi) - R*_np.sin(phi)
+            dY = dxdy*_np.sin(phi) + R*_np.cos(phi)
+            dZ = dzdy
+            B = _np.array([dX, dY, dZ])
+
+            # project into Frenet
+            r, T, N, Bf = _frenet_frame(s, self.splines)
+            Bt = _np.dot(B, T)
+            Bn = _np.dot(B, N)
+            Bb = _np.dot(B, Bf)
+
+            if abs(Bt)<1e-12: Bt = 1e-12
+
+            # use y as integration parameter → ds/dy etc.
+            ds = Bt
+            du = Bn
+            dv = Bb
+
+            return [ds, du, dv]
+
+        # integrate for all points
+        result = _np.zeros((len(y_values), len(x_values), 2))
+        result[0,:,0] = x_values
+        result[0,:,1] = z_values
+
+        for i in range(len(x_values)):
+            suv0 = [s0[i], u0[i], v0[i]]
+            sol = _odeint(rhs, suv0, y_values)
+            for j,suv in enumerate(sol):
+                s,u,v = suv
+                X,Y,Z = self._xyz_from_suv(s,u,v)
+                result[j,i,0] = _np.sqrt(X*X + Y*Y)
+                result[j,i,1] = Z
+
+        # reshape to match Zoidberg API
+        return result.reshape(y_values.shape + orig_shape + (2,))
