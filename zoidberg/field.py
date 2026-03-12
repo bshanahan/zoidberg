@@ -1948,3 +1948,56 @@ class EMC3(MagneticField):
                 vals[ni, i] = interp(si[ni])
 
         return vals
+
+
+import numpy as np
+
+try:
+    import gvec
+    _HAVE_GVEC = True
+except ImportError:
+    gvec = None
+    _HAVE_GVEC = False
+
+
+class GVECField(MagneticField):
+
+    def __init__(self, ini_file, dat_file, frenet):
+
+        if not _HAVE_GVEC:
+            raise ImportError(
+                "GVECField requires the 'gvec' Python package. "
+                "Install it using pip install gvec"
+                "https://gvec.readthedocs.io/latest/index.html"
+            )
+
+        self.state = gvec.State(ini_file, dat_file)
+        self.frenet = frenet
+        # self.field_direction = self._field_direction
+
+
+    def B_cartesian(self,X,Y,Z):
+
+        ev = self.state.evaluate("B", X=X, Y=Y, Z=Z)
+
+        B = ev.B.values
+
+        return B[...,0],B[...,1],B[...,2]
+
+    def field_direction(self,pos,phi):
+
+        R,Z = pos
+
+        X,Y,Zc = self.frenet.xyz_from_RZphi(R,Z,phi)
+
+        Bx,By,Bz = self.B_cartesian(X,Y,Zc)
+
+        R_cyl = np.sqrt(X*X+Y*Y)
+
+        BR = Bx*np.cos(phi) + By*np.sin(phi)
+        Bphi = -Bx*np.sin(phi) + By*np.cos(phi)
+
+        dR_dphi = BR/Bphi
+        dZ_dphi = Bz/Bphi
+
+        return dR_dphi,dZ_dphi
